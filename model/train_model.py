@@ -1,136 +1,167 @@
 import pandas as pd
 import numpy as np
-import tensorflow as tf
 import joblib
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-from tensorflow.keras.layers import Dense, Input, Dropout, BatchNormalization, Multiply
-from tensorflow.keras.models import Model
-from tensorflow.keras.utils import to_categorical
+import os
+import matplotlib.pyplot as plt
 
-# -------------------------------
-# Custom Focal Loss
-# -------------------------------
-def focal_loss(gamma=2., alpha=0.25):
-    def loss(y_true, y_pred):
-        epsilon = 1e-7
-        y_pred = tf.clip_by_value(y_pred, epsilon, 1. - epsilon)
-        cross_entropy = -y_true * tf.math.log(y_pred)
-        weight = alpha * tf.math.pow(1 - y_pred, gamma)
-        return tf.reduce_mean(tf.reduce_sum(weight * cross_entropy, axis=1))
-    return loss
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from imblearn.over_sampling import SMOTE
+from xgboost import XGBClassifier
+from imblearn.pipeline import Pipeline
 
+os.makedirs("saved_model", exist_ok=True)
+os.makedirs("figures", exist_ok=True)
 
-# -------------------------------
-# Load Data
-# -------------------------------
+# -------------------------
+# Load Dataset
+# -------------------------
 df = pd.read_csv("data/Obesity prediction.csv")
 
-# -------------------------------
-# Select ONLY 9 Features
-# -------------------------------
+# -------------------------
+# Feature Engineering
+# -------------------------
+df["Weight_to_Age"] = df["Weight"] / df["Age"]
+df["Height_to_Age"] = df["Height"] / df["Age"]
+df["Activity_Ratio"] = df["FAF"] / (df["TUE"] + 1)
+df["Activity_Hydration"] = df["FAF"] * df["CH2O"]
+
 features = [
-    "Age",
-    "Height",
-    "Weight",
-    "family_history",
-    "SMOKE",
-    "FAVC",
-    "FAF",
-    "TUE",
-    "CH2O"
+    "Age", "Height", "Weight",
+    "family_history", "SMOKE", "FAVC",
+    "FAF", "TUE", "CH2O",
+    "Weight_to_Age",
+    "Height_to_Age",
+    "Activity_Ratio",
+    "Activity_Hydration"
 ]
 
-target_column = "Obesity"
+target = "Obesity"
 
 X = df[features].copy()
-y = df[target_column]
+y = df[target]
 
-# -------------------------------
-# Encode Target
-# -------------------------------
-target_encoder = LabelEncoder()
-y = target_encoder.fit_transform(y)
+# -------------------------
+# Encode Categorical Features
+# -------------------------
+categorical_cols = ["family_history", "SMOKE", "FAVC"]
+cat_encoders = {}
 
-# -------------------------------
-# Encode Categorical Columns
-# -------------------------------
-cat_cols = X.select_dtypes(include=['object']).columns
-encoders = {}
-
-for col in cat_cols:
+for col in categorical_cols:
     le = LabelEncoder()
     X[col] = le.fit_transform(X[col])
-    encoders[col] = le
+    cat_encoders[col] = le
 
-# -------------------------------
-# Scale Features
-# -------------------------------
-scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X)
+# -------------------------
+# Encode Target
+# -------------------------
+label_encoder = LabelEncoder()
+y_encoded = label_encoder.fit_transform(y)
 
-# -------------------------------
-# Save Preprocessing Objects
-# -------------------------------
-joblib.dump(scaler, "saved_model/scaler.pkl")
-joblib.dump(target_encoder, "saved_model/label_encoder.pkl")
-joblib.dump(encoders, "saved_model/categorical_encoders.pkl")
-
-# -------------------------------
-# Train Test Split
-# -------------------------------
+# -------------------------
+# Train/Test Split
+# -------------------------
 X_train, X_test, y_train, y_test = train_test_split(
-    X_scaled, y,
-    stratify=y,
+    X,
+    y_encoded,
     test_size=0.2,
-    random_state=42
+    random_state=42,
+    stratify=y_encoded
 )
 
-y_train = to_categorical(y_train)
-y_test = to_categorical(y_test)
+# -------------------------
+# Build Pipeline
+# -------------------------
+pipeline = Pipeline([
+    ("scaler", StandardScaler()),
+    ("smote", SMOTE(random_state=42)),
+    ("model", XGBClassifier(
+        n_estimators=600,
+        max_depth=7,
+        learning_rate=0.03,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        gamma=0.1,
+        min_child_weight=2,
+        objective="multi:softprob",
+        eval_metric="mlogloss",
+        random_state=42
+    ))
+])
 
-# -------------------------------
-# Build Model
-# -------------------------------
-input_layer = Input(shape=(X_train.shape[1],))
+# -------------------------
+# Train Pipeline
+# -------------------------
+pipeline.fit(X_train, y_train)
 
-x = Dense(256, activation='relu')(input_layer)
-x = BatchNormalization()(x)
-x = Dropout(0.4)(x)
+# -------------------------
+# Evaluate
+# -------------------------
+y_pred = pipeline.predict(X_test)
 
-# Attention
-attention = Dense(256, activation='softmax')(x)
-x = Multiply()([x, attention])
+accuracy = accuracy_score(y_test, y_pred)
 
-x = Dense(128, activation='relu')(x)
-x = BatchNormalization()(x)
-x = Dropout(0.3)(x)
+print("\nXGBoost Test Accuracy:", round(accuracy, 4))
+print("\nClassification Report:\n")
+print(classification_report(y_test, y_pred))
 
-x = Dense(64, activation='relu')(x)
-x = Dropout(0.2)(x)
+# -------------------------
+# Confusion Matrix (Improved)
+# -------------------------
+cm = confusion_matrix(y_test, y_pred)
 
-output = Dense(y_train.shape[1], activation='softmax')(x)
+# Normalize (important for papers)
+cm_normalized = cm.astype("float") / cm.sum(axis=1)[:, np.newaxis]
 
-model = Model(inputs=input_layer, outputs=output)
+plt.figure()
+plt.imshow(cm_normalized)
+plt.title("Normalized Confusion Matrix")
+plt.xlabel("Predicted Label")
+plt.ylabel("True Label")
+plt.colorbar()
 
-model.compile(
-    optimizer=tf.keras.optimizers.Adam(0.001),
-    loss=focal_loss(gamma=2, alpha=0.25),
-    metrics=['accuracy']
-)
+class_names = label_encoder.classes_
+plt.xticks(np.arange(len(class_names)), class_names, rotation=45)
+plt.yticks(np.arange(len(class_names)), class_names)
 
-model.summary()
+for i in range(len(class_names)):
+    for j in range(len(class_names)):
+        plt.text(j, i, f"{cm_normalized[i, j]:.2f}",
+                 ha="center", va="center")
 
-model.fit(
-    X_train, y_train,
-    validation_data=(X_test, y_test),
-    epochs=50,
-    batch_size=32
-)
+plt.tight_layout()
+plt.savefig("figures/confusion_matrix.png")
+plt.show()
 
-# -------------------------------
-# Save Model
-# -------------------------------
-model.save("saved_model/obesity_model.keras")
+# -------------------------
+# Feature Importance (Paper Bonus)
+# -------------------------
+model = pipeline.named_steps["model"]
 
-print("Training Completed ✅")
+importances = model.feature_importances_
+
+plt.figure()
+plt.bar(features, importances)
+plt.title("Feature Importance (XGBoost)")
+plt.xticks(rotation=45)
+plt.ylabel("Importance Score")
+plt.tight_layout()
+plt.savefig("figures/feature_importance.png")
+plt.show()
+
+# -------------------------
+# Cross Validation
+# -------------------------
+cv_scores = cross_val_score(pipeline, X, y_encoded, cv=5)
+print("CV Accuracy:", round(cv_scores.mean(), 4))
+
+# -------------------------
+# Save Components
+# -------------------------
+joblib.dump(model, "saved_model/xgboost_model.pkl")
+joblib.dump(pipeline.named_steps["scaler"], "saved_model/scaler.pkl")
+joblib.dump(label_encoder, "saved_model/label_encoder.pkl")
+joblib.dump(cat_encoders, "saved_model/categorical_encoders.pkl")
+
+print("\nModel and preprocessing objects saved successfully!")
