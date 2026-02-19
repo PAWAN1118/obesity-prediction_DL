@@ -7,3 +7,4 @@ shap
 joblib
 matplotlib
 lime
+protobuf==3.20.3
