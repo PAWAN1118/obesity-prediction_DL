@@ -6,3 +6,4 @@ streamlit
 shap
 joblib
 matplotlib
+lime
